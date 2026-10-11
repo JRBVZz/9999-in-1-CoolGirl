@@ -1,66 +1,3 @@
-# options_prompt.py
-# Версия: 5.30 (Level 3 + предвзвод спрайта S/T на 1 кадр)
-#
-# V5.30: устранение «лишнего кадра» при появлении буквы S в подсказке START.
-#        ПРИЧИНА: надпись пишется в nametable в том же NMI, где принимается
-#        решение её показать, а спрайт-буква S взводится хуком только в конце
-#        кадра и реально попадает в PPU следующим OAM DMA (DMA перенесён в
-#        начало NMI в V5.27). Итог — 1 кадр, где видна «голая» буква фона
-#        не того цвета, и лишь затем её накрывает спрайт.
-#        РЕШЕНИЕ (двухстадийный предвзвод, флаг PROMPT_ARM_PENDING):
-#          кадр 1 — взводим спрайт S (через хук), надпись НЕ рисуем;
-#          кадр 2 — рисуем надпись prompt_show; спрайт как раз DMA'ится в
-#                   начале этого кадра → буква и текст появляются ОДНОВРЕМЕННО.
-#        Задержка показа подсказки = 1 кадр (~16 мс), незаметно.
-#        Буква T (submenu) предвзвода не требует: после чанкинга спрайт T
-#        приходит раньше, чем рисуется строка EXIT, «голой» буквы там нет.
-#        Изменения только в build_service_menu_ui_nmi и build_fixed_combined_nmi_hook.
-#
-# V5.29 (Уровень 3): устранение мигания фона при входе в доп.меню и при
-#        переключении настроек on/off.
-#
-#        ПРИЧИНА мигания: на «тяжёлом» кадре submenu_draw писал ~49 байт в
-#        $2007 одним пакетом. После переноса OAM DMA в начало NMI (V5.27)
-#        эти 49 записей + 514 тактов DMA вместе не помещались в один vblank
-#        (~2273 такта NTSC) → часть записей $2007 вылезала за vblank →
-#        разрыв/мигание фона. Пропуск sprite_engine (V5.28) не помогал —
-#        он экономил такты RAM-работы, а не критичные такты $2007.
-#
-#        РЕШЕНИЕ (chunking): отрисовка submenu разбита на ОДИН регион за кадр.
-#        Шаг хранится в SUBMENU_DIRTY:
-#            0x00 = покой
-#            0x04 = снапшот (один кадр; чтения фон не рвут)
-#            0x08 = рисовать MUSIC   → 0x07
-#            0x07 = рисовать INTRO   → 0x06
-#            0x06 = рисовать FIRST+PAGE → 0x05
-#            0x05 = рисовать EXIT    → 0x00 (готово → mu_force_cursor)
-#        За кадр пишется максимум 19 байт в $2007 → вместе с OAM DMA всегда
-#        влезает в vblank. Меню «дорисовывается» за ~5 кадров (≈85 мс) —
-#        как быстрое появление, без мигания. Во время сборки ввод игнорируется
-#        (DIRTY≠0), что убирает гонки.
-#
-#        Прочее по V5.29:
-#        - combined_nmi_hook откатан к чистому V5.27 (OAM DMA в начале NMI,
-#          без stack-флага «тяжёлого кадра» из V5.28 — он реагировал на
-#          DIRTY==1, которого больше нет; это освобождает ~28 байт fixed-банка).
-#        - snapshot_vblank в конце ставит DIRTY=0x08 (старт пошаговой отрисовки)
-#          вместо DIRTY=1.
-#        - на кадре снапшота вызывается text_overlay → палитра S/T корректна
-#          сразу, без кадров «чужого» цвета во время сборки submenu.
-#        - submenu_draw определяет screen13 по SCREEN_CACHE (==0x0D) в каждой
-#          фазе; параметр alt_ensure_cpu сохранён в сигнатуре, но не используется
-#          (актуальная конфигурация при активном multi_alt и так передаёт None).
-#
-# ----------------------------------------------------------------------------
-# (история ниже — V5.20)
-#
-# Исправление проблемы с сохранением тайлов на всех экранах:
-#
-# РЕШЕНИЕ V5.20:
-# 1) build_service_snapshot_vblank: PPU READ snapshot в vblank.
-# 2) build_service_menu_ui_nmi: snapshot при SUBMENU_DIRTY==4.
-# 3) SUB_SNAP буферы (0x7FA0-0x7FD2) содержат копию тайлов для восстановления.
-
 from config import *
 from utils import *
 from asm6502 import *
@@ -188,7 +125,7 @@ APU_4015       = 0x4015
 CFG_MUSIC   = 0x01
 CFG_SPLASH  = 0x02
 CFG_MASK    = 0x03
-CFG_DEFAULT = (CFG_MUSIC | CFG_SPLASH)
+CFG_DEFAULT = (CFG_MUSIC | (CFG_SPLASH if INTRO_DEFAULT_ON else 0))   # INTRO_DEFAULT_ON из config.py
 
 CFG_S_SIG0  = 0x7FF0
 CFG_S_SIG1  = 0x7FF1
@@ -919,6 +856,17 @@ def build_fixed_combined_nmi_hook(origin_cpu: int,
                                   sprite_engine_cpu: int = 0xC5C0,
                                   marquee_nmi_cpu=None) -> bytes:
     marq = f"    jsr ${marquee_nmi_cpu:04X}\n" if marquee_nmi_cpu is not None else ""
+    # Пауза marquee при name_visible > 11, пока зажат Start или показана подсказка
+    # (кадры show/hide + text_overlay), иначе vblank переполняется.
+    marq_pause = ""
+    if marquee_nmi_cpu is not None and MARQ_PAUSE_ON_PROMPT and NAME_VISIBLE > 11:
+        marq_pause = f"""    ; Start зажат или подсказка на экране -> без marquee (бюджет vblank)
+    lda $22
+    and #${BTN_START:02X}
+    bne cn_no_marq
+    lda ${OPTIONS_PROMPT_SHOWN:04X}
+    bne cn_no_marq
+"""
     src = f"""
 combined_nmi_hook:
     pha
@@ -956,7 +904,7 @@ cn_after_dma:
     ; marquee — иначе marquee + prompt_show в одном vblank → моргание фона.
     lda ${PROMPT_ARM_PENDING:04X}
     bne cn_no_marq
-{marq}
+{marq_pause}{marq}
 cn_no_marq:
     jsr ${ui_stub_cpu:04X}
 

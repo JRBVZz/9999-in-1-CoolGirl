@@ -1,11 +1,3 @@
-# fixed_bank.py
-# Версия: 5.7
-#
-# Изменения относительно V5.6:
-# - build_menu_init_wrapper: добавлен вызов overlay_init_stub_cpu
-#   (копирование S/T из PT0 в PT1 при PPU off, один раз при инициализации меню).
-# - build_maybe_flush_with_warning: без изменений.
-
 from config import *
 from utils import *
 from asm6502 import *
@@ -640,7 +632,83 @@ def build_nav_wrapper(origin_cpu, name, original_cpu, save_state_cpu):
     return assemble_6502(src, origin_cpu)
 
 
-def build_load_state(origin_cpu, enable_ram_cpu, disable_ram_cpu):
+def build_nav_page_norepeat(origin_cpu, total, save_state_cpu, wait_cpu=0xEC4D):
+    """
+    Листание страницами (16 строк) для режима без повторов (REPEAT_LIST = False).
+    Заменяет оригинальные процедуры $EBF8 (page down) и $EC58 (page up), в которых
+    предел 9999 зашит в код. Позиция - $18 (lo), $19 (hi), $17 всегда 0 (total < 65536).
+
+    page down: на последней странице -> первая страница (строка 0); иначе slot += 16,
+               а если он за концом списка - начало последней страницы.
+    page up:   slot -= 16; если ниже нуля -> начало последней страницы.
+    В конце - оригинальная пауза 8 кадров (wait_cpu, в оригинале $EC4D: LDA #0 / STA $24 /
+    ждать $24 == 8 / RTS) и JMP на save_state (он возвращается RTS).
+    Обёртки вокруг не нужны. Возвращает (code, page_down_cpu, page_up_cpu).
+    """
+    assert 1 <= total <= 0xFFFF
+    th, tl = (total >> 8) & 0xFF, total & 0xFF
+    lp = (total - 1) & 0xFFF0               # начало последней страницы
+    ph, pl = (lp >> 8) & 0xFF, lp & 0xFF
+
+    common = f"""
+nav_pg_lp:
+    lda #${pl:02X}
+    sta $18
+    lda #${ph:02X}
+    sta $19
+nav_pg_end:
+    jsr ${wait_cpu:04X}
+    jmp ${save_state_cpu:04X}
+nav_pg_zero:
+    lda #$00
+    sta $18
+    sta $19
+    beq nav_pg_end
+"""
+    page_down = f"""
+nav_pd:
+    lda $18
+    cmp #${pl:02X}
+    lda $19
+    sbc #${ph:02X}
+    bcs nav_pg_zero
+    lda $18
+    clc
+    adc #$10
+    sta $18
+    bcc nav_pd_hi
+    inc $19
+nav_pd_hi:
+    lda $18
+    cmp #${tl:02X}
+    lda $19
+    sbc #${th:02X}
+    bcc nav_pg_end
+    bcs nav_pg_lp
+"""
+    page_up = """
+nav_pu:
+    lda $18
+    sec
+    sbc #$10
+    sta $18
+    lda $19
+    sbc #$00
+    sta $19
+    bcs nav_pg_end
+    bcc nav_pg_lp
+"""
+    # Смещения точек входа: собираем префиксы (в них нет ссылок вперёд).
+    pd_off = len(assemble_6502(common, origin_cpu))
+    pu_off = len(assemble_6502(common + page_down, origin_cpu))
+    code = assemble_6502(common + page_down + page_up, origin_cpu)
+    return code, origin_cpu + pd_off, origin_cpu + pu_off
+
+
+def build_load_state(origin_cpu, enable_ram_cpu, disable_ram_cpu,
+                     total_slots=9999):
+    # total_slots: сохранённая позиция должна быть < total_slots (иначе сброс в 0)
+    th, tl = (total_slots >> 8) & 0xFF, total_slots & 0xFF
     src = f"""
 load_state:
     jsr ${enable_ram_cpu:04X}
@@ -680,11 +748,11 @@ load_state:
     jmp ls_clear
 ls_chk_mid:
     lda $19
-    cmp #$27
+    cmp #${th:02X}
     bcc ls_ok
     bne ls_clear
     lda $18
-    cmp #$0F
+    cmp #${tl:02X}
     bcs ls_clear
 ls_ok:
     rts
@@ -836,6 +904,62 @@ ips_clr_cache:
     bne ips_clr_cache
 """
 
+    # ── Нумерация списка ──────────────────────────────────────────────
+    # Флаги берутся из config.py (settings.ini, [menu]):
+    #   SHOW_LIST_NUMBER    - "0001." перед именем (4 цифры BCD + точка)
+    #   SHOW_REPEAT_COUNTER - счётчик повторов списка "00".."99" после имени
+    #   LIST_SHIFT_LEFT     - без номера имя начинается с колонки LIST_LINE_COL
+    #                         (marquee.py берёт ту же колонку из LIST_NAME_COL)
+    # Число тайлов в строке сохраняется (хвост добивается пробелами $26),
+    # чтобы не оставалось мусора на месте прежних символов.
+    shifted = LIST_SHIFT_LEFT and not SHOW_LIST_NUMBER
+
+    if SHOW_LIST_NUMBER:
+        number_draw = f"""
+    lda $6C
+    sta ${PPUDATA:04X}
+    lda $6D
+    sta ${PPUDATA:04X}
+    lda $6E
+    sta ${PPUDATA:04X}
+    lda $6F
+    sta ${PPUDATA:04X}
+    lda #$25
+    sta ${PPUDATA:04X}
+"""
+    elif shifted:
+        number_draw = ""
+    else:
+        number_draw = f"""
+    lda #$26
+    sta ${PPUDATA:04X}
+    sta ${PPUDATA:04X}
+    sta ${PPUDATA:04X}
+    sta ${PPUDATA:04X}
+    sta ${PPUDATA:04X}
+"""
+
+    # Хвост после имени. Исходная строка занимала LINE_TILES=19 тайлов
+    # (номер 5 + имя 11 + пробел 1 + счётчик 2). Пробелами добиваем строку только
+    # до этой длины: при длинных именах (name_visible > 11) за именем ничего
+    # не пишем, иначе пробелы затирают фон справа от списка.
+    LINE_TILES = 19
+    lead_tiles = 0 if shifted else 5
+    if SHOW_REPEAT_COUNTER:
+        tail_draw = f"""
+    lda #$26
+    sta ${PPUDATA:04X}
+    lda ${CUR_REPEAT:04X}
+    jsr print_repeat
+"""
+        used_tiles = lead_tiles + NAME_VISIBLE + 3
+    else:
+        tail_draw = ""
+        used_tiles = lead_tiles + NAME_VISIBLE
+    tail_pad = max(0, LINE_TILES - used_tiles)
+    if tail_pad:
+        tail_draw += "\n    lda #$26\n" + (f"    sta ${PPUDATA:04X}\n" * tail_pad)
+
     src = f"""
 ext_draw_list_line:
     pha
@@ -889,18 +1013,7 @@ inc_loop:
     bne inc_loop
     ; wrap 9999 -> 0000: все цифры уже в '0', $6B не трогаем
     ; (init_page_state перевыставит TMP2=0 для следующего page rebuild)
-bcd_done:
-    lda $6C
-    sta ${PPUDATA:04X}
-    lda $6D
-    sta ${PPUDATA:04X}
-    lda $6E
-    sta ${PPUDATA:04X}
-    lda $6F
-    sta ${PPUDATA:04X}
-    lda #$25
-    sta ${PPUDATA:04X}
-
+bcd_done:{number_draw}
     lda $1C
     and #$0F
     sta ${ROW_TMP:04X}
@@ -925,12 +1038,7 @@ nm_write:
     cpy #${NAME_VISIBLE:02X}
     bne name_loop
 
-    lda #$26
-    sta ${PPUDATA:04X}
-
-    lda ${CUR_REPEAT:04X}
-    jsr print_repeat
-
+{tail_draw}
     lda ${ROW_TMP:04X}
     asl a
     tay

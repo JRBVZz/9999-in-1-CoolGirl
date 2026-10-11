@@ -178,7 +178,7 @@ mul_loop:
     bne mul_loop
     lda ${MARQ_MUL_LO:04X}
     clc
-    adc #$4B
+    adc #${0x40 + LIST_NAME_COL:02X}
     sta ${MARQ_PPU_LO:04X}
     lda ${MARQ_MUL_HI:04X}
     adc #$20

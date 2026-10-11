@@ -1,70 +1,3 @@
-# builder.py
-# Версия: V5.26
-#
-# V5.26: УЛУЧШЕНО ЛОГИРОВАНИЕ И ПРОВЕРКА РАЗМЕРА:
-#        1) Строка «Уникальных игр: …» перенесена в самый низ вывода.
-#        2) Дедуп теперь печатает, какие именно игры — дубли (имя дубля = имя
-#           оригинала, с которым делится офсетом во флеше).
-#        3) После строки NES 2.0 header выводится сколько зарезервировано под
-#           battery-сейвы и сколько места осталось для новых игр (по лимиту чипа).
-#        4) Ошибка переполнения больше НЕ печатает удвоенную степень двойки
-#           («268435456 > 134217728»). Вместо этого пишется реальный размер
-#           (игры + резерв сейвов) и насколько КБ превышен лимит.
-#        Логика размещения и формат ROM не изменены.
-#
-# V5.25: РАЗМЕЩЕНИЕ ИГР переписано под точную копию алгоритма ClusterM Combiner
-#        (pow2-выравнивание PRG, сортировка по убыванию размера, first-fit от нуля,
-#        CHR заполняет дыры между PRG-блоками шагом 0x2000) + ВСЕГДА включённый
-#        дедуп идентичных блоков: одинаковые PRG и одинаковые CHR (по содержимому)
-#        кладутся в один офсет флеша. Это гарантированный аналог байтового слияния
-#        WillFit у Кластера (dest[addr]==source[...]), но не зависит от того,
-#        дойдёт ли first-fit до близнеца — дубли всегда схлопываются.
-#        Область < GAMES_START резервируется как LOADER (первые 128 КБ) у Кластера.
-#
-# V5.24: ФИКС NES 2.0 PRG-size encoding.
-#        Старый код безусловно писал линейное представление (b4 = p16k & 0xFF,
-#        b9.lo = p16k >> 8) с MSB nibble = 0xF, что является НЕВАЛИДНЫМ NES 2.0
-#        для p16k > 0xEFF. По спеке nesdev (https://www.nesdev.org/wiki/NES_2.0):
-#          - если p16k ≤ 0xEFF: linear, b4 = p16k & 0xFF, b9.lo = p16k >> 8
-#          - если p16k > 0xEFF: exponent-multiplier, b4 = (E<<2)|M, b9.lo = 0xF
-#            где размер = 2^E × (2M+1) страниц по 16 KB
-#        Новый encode_prg_size() (логика портирована из ClusterM/nes-containers
-#        NesFile.cs) автоматически выбирает корректную форму.
-#        Симптом старого бага: на больших сборках (>60 MB) ROM показывал серый
-#        экран в FCEUX (например N=2039 с p16k=0xFF7 → b4=0xF7, MSB=0xF —
-#        строгий парсер интерпретирует b4 как exponent: E=0x3D, M=3 = ерунда).
-#        N=2034 с p16k=0xFE3 → b4=0xE3 случайно "повезло" из-за специфики
-#        clamp-фолбэка в FCEUX.
-#
-# V5.23: подключена система multi_alt — анализ свободных тайлов на 14 экранах
-#        меню и автоматическое распределение кастомных тайлов (32 кириллицы +
-#        & + 8 спецсимволов = 41 кастом) в global-free слоты $AE..$D6 / $DD..$FF.
-#        Преимущества: (а) гарантия что кастомы не конфликтуют с фоном экранов,
-#        (б) фиксированный phys_tile на всех экранах — НЕТ runtime swap,
-#        (в) подготовлено расширение до 80 кастомов через multi_alt.
-#
-# V5.22 (предыдущая версия):
-# 1) APU frame counter IRQ как независимый источник тика музыки
-#    - reset_init_v43: STA $4017=$00, CLI после snd_init
-#    - irq_handler в fixed bank: ACK $4015, защита через SND_BUSY, JSR $FA67
-#    - IRQ-вектор $FFFE/$FFFF -> irq_handler_cpu (вместо $C001)
-#    - $C198 JSR $FA67 в оригинальном NMI -> NOP×3 (избегаем двойного тика)
-# 2) Музыка теперь тикает 60 Гц на NTSC / 50 Гц на PAL независимо от PPU.
-#    Никакие PPU-off секции (build_nametable, save_state и т.д.) больше не приводят
-#    к слышимым паузам музыки.
-#
-# Изменения V5.21 относительно V5.20:
-# 1) Добавлен svc_snapshot_vblank — PPU read snapshot в vblank (БЕЗ МИГАНИЯ, БЕЗ RENDER OFF!)
-# 2) build_service_menu_ui_nmi вызывает snapshot_vblank при SUBMENU_DIRTY==4
-# 3) build_fixed_nav_hook_v521: убран вызов snapshot (snapshot теперь в NMI vblank)
-# 4) Устранено мигание экрана при открытии дополнительного меню (START+A)
-#
-# АРХИТЕКТУРА V5.22:
-# - Музыка: APU frame IRQ + защита SND_BUSY от reentrancy
-# - PPU: snapshot через PPU read в vblank (без render off) — как в V5.21
-# - Vblank PPU snapshot вызывается из NMI при SUBMENU_DIRTY==4
-# - Все остальные V5.21 фичи сохранены
-
 import os
 import sys
 import math
@@ -328,6 +261,12 @@ def build():
         log(f"  ❌ Слишком много игр ({num_games}), максимум {MAX_UNIQUE_GAMES}")
         return False
 
+    # Число слотов списка: оригинальное меню показывает 9999 слотов, повторяя игры по
+    # кругу (REPEAT_LIST=True). Без повторов слотов ровно столько, сколько игр.
+    list_total = LIST_SLOTS_ORIG if REPEAT_LIST else num_games
+    if not REPEAT_LIST:
+        log(f"  Повторы списка отключены: слотов {list_total} (оригинал {LIST_SLOTS_ORIG})")
+
     next_save_id = 1
     for g in games:
         if g.battery:
@@ -340,20 +279,6 @@ def build():
             g.save_id = 0
     battery_count = next_save_id - 1
 
-    # V5.26: строка "Уникальных игр: …" перенесена в самый низ вывода (см. конец build()).
-
-    # =========================================================
-    # РАЗМЕЩЕНИЕ ИГР — точная копия алгоритма ClusterM Combiner
-    #   * PRG/CHR округляются до степени двойки (как Game.cs)
-    #   * PRG: сортировка по убыванию, шаг = собственный размер
-    #     (=> выравнивание на свой pow2), first-fit от нуля
-    #   * CHR: сортировка по убыванию, шаг 0x2000, first-fit —
-    #     заполняет дыры между PRG-блоками (как у Кластера)
-    #   * область < GAMES_START зарезервирована (аналог LOADER у Кластера)
-    #   * ДЕДУП (всегда вкл): идентичные по содержимому PRG и CHR кладутся
-    #     в один офсет флеша. Гарантированный аналог байтового слияния
-    #     WillFit у Кластера (dest[addr]==source[...]).
-    # =========================================================
     def _prg_alloc(g):
         # ap = реально записываемые байты (NROM 16K дублируется в 32K),
         # pa = выделение/выравнивание (pow2, не меньше ROM_ALIGN)
@@ -370,8 +295,6 @@ def build():
             pd = pd + pd
         return pd
 
-    # Верхняя граница "холста" для first-fit (гарантированно достаточно,
-    # дедуп только уменьшает реальное использование)
     _maxpa = max((_prg_alloc(g)[1] for g in games), default=ROM_ALIGN)
     _total = sum(_prg_alloc(g)[1] for g in games) + sum(_chr_alloc(g) for g in games)
     canvas_size = align_up(align_up(GAMES_START, _maxpa) + _total + ROM_ALIGN, ROM_ALIGN)
@@ -509,9 +432,6 @@ def build():
     if len(cm) < 8192:
         cm += bytearray(8192 - len(cm))
 
-    # =========================================================
-    # V5.23 multi_alt: универсальные кастомные тайлы (кириллица + спецы)
-    # =========================================================
     # Анализирует все 14 экранов меню и распределяет кастомные тайлы в
     # свободные слоты. 41 Класс-1 кастом (кириллица + & + 8 спецов) кладутся
     # в global-free слоты ($DD..$FC и $AE..$D6) — без runtime swap.
@@ -822,7 +742,8 @@ def build():
     if stage >= 2:
         svc_load_state_cpu = service_base_cpu + len(service_code)
         service_code      += build_service_load_state(svc_load_state_cpu,
-                                                      svc_enable_cpu, svc_disable_cpu)
+                                                      svc_enable_cpu, svc_disable_cpu,
+                                                      total_slots=list_total)
         svc_save_state_cpu = service_base_cpu + len(service_code)
         service_code      += build_service_save_state(svc_save_state_cpu,
                                                       svc_enable_cpu, svc_disable_cpu)
@@ -987,28 +908,6 @@ def build():
     # =========================================================
     bank0 = bytearray(orig.prg[:16384])
 
-    # V5.23: блок мёртвых патчей удалён (~564 байт мусора).
-    #
-    # Что было удалено и почему оно безопасно:
-    #
-    # [1] bank0[0x2DCC..] — game-id таблица $EDCC
-    #     Читалась только оригинальным draw_list_line ($C2EC), который мы
-    #     перенаправляем patch_jmp на ext_draw_list_line.
-    #
-    # [2] bank0[0x2FC0..] — level table $EFC0
-    #     Тот же оригинальный draw_list_line, не достижим.
-    #
-    # [3] bank0[0x3433/0x36EB] — патчи $2C $FF $FF в SAFE-окне.
-    #     Эти 6 байт всё равно перезаписываются ниже:
-    #     bank0[SAFE:SAFE + len(fixed_code)] = fixed_code.
-    #
-    # [4] bank0[0x2A65/0x2A7F/0x2A99] — level_addr/bankswitch/entry tables.
-    #     Читались только в оригинальном launch_game ($ED29),
-    #     который мы перенаправили на ext_launch_game.
-    #
-    # [5] bank0[0x2D8C..0x2D8E] — NOP×3 на JSR clear_before_launch.
-    #     Внутри оригинального launch_game, недостижим после patch_jmp.
-
     fixed_code     = bytearray()
     fixed_base_cpu = 0xC000 + SAFE
 
@@ -1117,7 +1016,8 @@ pre_launch_clear_stub:
     else:
         load_state_cpu = fixed_base_cpu + len(fixed_code)
         fixed_code    += build_load_state(load_state_cpu,
-                                          enable_ram_cpu, disable_ram_cpu)
+                                          enable_ram_cpu, disable_ram_cpu,
+                                          total_slots=list_total)
         save_state_cpu = fixed_base_cpu + len(fixed_code)
         fixed_code    += build_save_state(save_state_cpu,
                                           enable_ram_cpu, disable_ram_cpu)
@@ -1309,12 +1209,33 @@ calc_screen_hook:
                                             init_ma_map_ram_cpu=init_ma_map_ram_cpu,
                                             multi_alt_swap_stub_cpu=multi_alt_swap_stub_cpu)
 
-    wrap_page_down_cpu = fixed_base_cpu + len(fixed_code)
-    fixed_code        += build_nav_wrapper(wrap_page_down_cpu, "wrap_page_down",
-                                           0xEBF8, save_state_cpu)
-    wrap_page_up_cpu = fixed_base_cpu + len(fixed_code)
-    fixed_code      += build_nav_wrapper(wrap_page_up_cpu, "wrap_page_up",
-                                         0xEC58, save_state_cpu)
+    if REPEAT_LIST:
+        wrap_page_down_cpu = fixed_base_cpu + len(fixed_code)
+        fixed_code        += build_nav_wrapper(wrap_page_down_cpu, "wrap_page_down",
+                                               0xEBF8, save_state_cpu)
+        wrap_page_up_cpu = fixed_base_cpu + len(fixed_code)
+        fixed_code      += build_nav_wrapper(wrap_page_up_cpu, "wrap_page_up",
+                                             0xEC58, save_state_cpu)
+    else:
+        # Без повторов: свои процедуры листания страницами (в оригинале предел 9999
+        # зашит в код $EBF8/$EC58). Один общий блок с двумя точками входа; кладём в
+        # SAFE-2, если там есть место, иначе в основное SAFE-окно.
+        _np_s2_cpu = safe2_base_cpu + len(safe2_code)
+        _np_code, _np_pd, _np_pu = build_nav_page_norepeat(_np_s2_cpu, list_total,
+                                                           save_state_cpu)
+        if len(safe2_code) + len(_np_code) <= safe2_size:
+            safe2_code        += _np_code
+            _np_where          = "SAFE-2"
+        else:
+            _np_fx_cpu = fixed_base_cpu + len(fixed_code)
+            _np_code, _np_pd, _np_pu = build_nav_page_norepeat(_np_fx_cpu, list_total,
+                                                               save_state_cpu)
+            fixed_code        += _np_code
+            _np_where          = "fixed"
+        log(f"  листание страницами (без повторов): {len(_np_code)} байт, "
+            f"down=${_np_pd:04X} up=${_np_pu:04X} ({_np_where})")
+        wrap_page_down_cpu = _np_pd
+        wrap_page_up_cpu   = _np_pu
     wrap_nav_dec_cpu = fixed_base_cpu + len(fixed_code)
     fixed_code      += build_nav_wrapper(wrap_nav_dec_cpu, "wrap_nav_dec",
                                          0xEBA7, save_state_cpu)
@@ -1408,6 +1329,36 @@ calc_screen_hook:
     patch_abs_target_in_range(bank0, 0xECF3, 0xED28, 0xEC58, wrap_page_up_cpu)
     patch_abs_target_in_range(bank0, 0xECF3, 0xED28, 0xEBA7, wrap_nav_dec_cpu)
     patch_abs_target_in_range(bank0, 0xECF3, 0xED28, 0xEBD3, wrap_nav_inc_cpu)
+
+    if not REPEAT_LIST:
+        # Предел 9999 ($270F) зашит в оригинальном коде: конец списка при отрисовке
+        # страницы ($C26C), заворот при движении вверх на нуле (nav dec $EBA7) и
+        # заворот вниз на последней игре (nav inc $EBD3). Меняем на число игр.
+        # Листание страницами заменено своими процедурами (см. выше).
+        _lt_hi, _lt_lo = (list_total >> 8) & 0xFF, list_total & 0xFF
+        _lt_patches = [
+            (0xC2D6, 0xC9, 0x27, _lt_hi, "конец страницы $C26C hi"),
+            (0xC2DC, 0xC9, 0x0F, _lt_lo, "конец страницы $C26C lo"),
+            (0xEBB7, 0xA9, 0x27, _lt_hi, "nav dec: заворот hi"),
+            (0xEBBB, 0xA9, 0x0F, _lt_lo, "nav dec: заворот lo"),
+            (0xEBE7, 0xC9, 0x27, _lt_hi, "nav inc: предел hi"),
+            (0xEBED, 0xC9, 0x0F, _lt_lo, "nav inc: предел lo"),
+        ]
+        _wait_orig = bytes([0xA9, 0x00, 0x85, 0x24, 0xA5, 0x24, 0xC9, 0x08, 0xD0, 0xFA, 0x60])
+        if bytes(bank0[0xEC4D - 0xC000:0xEC4D - 0xC000 + len(_wait_orig)]) != _wait_orig:
+            log("  ❌ REPEAT_LIST=False: по $EC4D нет ожидаемой паузы (LDA #0/STA $24/.../RTS), "
+                "другая версия оригинальной ROM?")
+            return False
+        for _a, _opc, _old, _new, _what in _lt_patches:
+            _o = _a - 0xC000
+            if bank0[_o] != _opc or bank0[_o + 1] != _old:
+                log(f"  ❌ REPEAT_LIST=False: по ${_a:04X} ({_what}) ожидалось "
+                    f"{_opc:02X} {_old:02X}, найдено {bank0[_o]:02X} {bank0[_o + 1]:02X} "
+                    f"(другая версия оригинальной ROM?)")
+                return False
+            bank0[_o + 1] = _new
+        log(f"  REPEAT_LIST=False: предел списка в оригинальном коде = {list_total} "
+            f"({len(_lt_patches)} патчей)")
 
     patch_bytes(bank0, 0xC193,
                 bytes([0x20,

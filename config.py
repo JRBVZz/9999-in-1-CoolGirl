@@ -1,28 +1,3 @@
-# config.py
-# Версия: V5.24.2
-# V5.24.2 (V5.32-audit): зафиксирован PROMPT_ARM_PENDING в карте RAM (ранее жил
-#          хардкодом в options_prompt.py с V5.30).
-#          - mode=2: PROMPT_ARM_PENDING = 0x06F6 (был помечен как свободный).
-#                    Свободным остаётся только $06F7.
-#          - mode=1: PROMPT_ARM_PENDING = 0x0760 (в mode=1 $06F6 = ROW_TMP!),
-#                    берём свободный $0760. Свободным остаётся $0761.
-#          Рекомендуется удалить локальное определение PROMPT_ARM_PENDING
-#          в options_prompt.py — теперь оно приходит из config (from config import *).
-# V5.24.1: фикс критических багов RAM-разметки (mode=2 / NAME_MODE=2):
-#          - Баг 1: DIR_HELPER_LIMIT был off-by-one (0x0695 = MUSIC_PENDING+1),
-#            что разрешало dir-helper'у залезть на байт MUSIC_PENDING ($0694).
-#            Теперь DIR_HELPER_LIMIT = MUSIC_PENDING (0x0694).
-#          - Баг 2: PAGE_LAUNCH_BASE (0x0741, 16*12=192 байта → $0741..$0800)
-#            перекрывал SND_BUSY($07F0)/MA_LOADED_SCREEN($07F1)/MA_BACKUP_DEPTH($07F2)
-#            и весь MA_MAP_RAM($0782..$07DA). Это мёртвый код → выставлен в None.
-# V5.24:   добавлен TILES_DIR — drop-in папка с PNG-тайлами кастомов.
-#          Альтернатива multi_alt.ini для простых случаев (кинул PNG → собралось).
-# V5.23:   добавлен MULTI_ALT_INI для multi_alt.ini (пользовательские кастомы).
-# V5.22.6: добавлен слой user_config — пользовательские параметры теперь
-#          читаются из settings.ini, архитектурные остаются здесь хардкодом.
-# V5.22:   Добавлены SND_BUSY=0x07F0, APUFRAME=$4017 для APU frame IRQ-движка музыки
-# V5.12:   Добавлен SNAP_VALID = 0x0740, PAGE_LAUNCH_BASE сдвинут на 0x0741
-
 # === Пользовательские параметры (из settings.ini) ===
 # При отсутствии файла или ключа — используется default из строки.
 import os
@@ -59,8 +34,53 @@ NAME_MODE    = _uc.get_int("menu", "name_mode",    2)
 NAME_MAX     = _uc.get_int("menu", "name_max",     48)
 NAME_VISIBLE = _uc.get_int("menu", "name_visible", 11)
 
+# Нумерация и раскладка строки списка (settings.ini, секция [menu]).
+# Оригинальная строка: колонка 6 + "0001." -> имя начинается с колонки 11.
+SHOW_LIST_NUMBER    = _uc.get_bool("menu", "show_list_number",    False)  # "0001." перед именем
+SHOW_REPEAT_COUNTER = _uc.get_bool("menu", "show_repeat_counter", False)  # "00".."99" после имени
+LIST_SHIFT_LEFT     = _uc.get_bool("menu", "shift_left",          True)   # имя с колонки 6, если номера нет
+# Повторы списка. Оригинальное меню всегда показывает 9999 слотов: список игр
+# повторяется по кругу, пока не наберётся 9999 строк.
+#   True  - как раньше (9999 слотов, игры повторяются),
+#   False - в списке ровно столько строк, сколько игр, без повторов.
+REPEAT_LIST = _uc.get_bool("menu", "repeat_list", True)
+LIST_SLOTS_ORIG = 9999   # число слотов в оригинальном меню (зашито в его коде)
+
+LIST_LINE_COL = 6
+LIST_NAME_COL = LIST_LINE_COL if (LIST_SHIFT_LEFT and not SHOW_LIST_NUMBER) else LIST_LINE_COL + 5
+
+# Проверка name_visible (mode=2): строка списка не должна выходить за 32 колонки
+# (иначе запись уйдёт в начало следующей строки и испортит рамку), а имя должно
+# помещаться в буфер каталога и в RESTORE_BUF.
+if NAME_MODE == 2:
+    _extra = 3 if SHOW_REPEAT_COUNTER else 0                       # пробел + счётчик(2)
+    _tiles = (LIST_NAME_COL - LIST_LINE_COL) + NAME_VISIBLE + _extra   # [номер] имя [счётчик]
+    _max_visible = 32 - LIST_LINE_COL - (LIST_NAME_COL - LIST_LINE_COL) - _extra
+    if NAME_VISIBLE < 1 or NAME_VISIBLE > NAME_MAX or NAME_VISIBLE > 0x0782 - 0x0741:
+        raise ValueError("name_visible=%d вне допустимого диапазона 1..%d" %
+                         (NAME_VISIBLE, min(NAME_MAX, 0x0782 - 0x0741)))
+    if LIST_LINE_COL + _tiles > 32:
+        raise ValueError("name_visible=%d не помещается в строку списка: максимум %d "
+                         "(show_list_number=%s, shift_left=%s)" %
+                         (NAME_VISIBLE, _max_visible, SHOW_LIST_NUMBER, LIST_SHIFT_LEFT))
+
 MARQUEE_ENABLED  = _uc.get_bool("marquee", "enabled", True)
 MARQ_STEP_FRAMES = _uc.get_int("marquee",  "speed",   15)
+
+# Пауза бегущей строки, пока зажат Start или на экране подсказка меню опций.
+# Бюджет vblank подбирался при name_visible = 11. При больших значениях marquee
+# (запись NAME_VISIBLE тайлов) вместе с prompt_show/prompt_hide/text_overlay не
+# помещается в vblank: мерцает фон, меняются цвета. Пауза включается только при
+# name_visible > 11 (settings.ini, [marquee] pause_on_prompt).
+MARQ_PAUSE_ON_PROMPT = _uc.get_bool("marquee", "pause_on_prompt", True)
+
+# Заставка (intro) при запуске меню. Это значение по умолчанию для опции
+# "INTRO ON/OFF" в дополнительном меню (settings.ini, секция [menu]).
+# False - заставка выключена по умолчанию, True - включена (как в оригинале).
+# ВАЖНО: применяется только когда в SRAM картриджа ещё нет сохранённых настроек
+# (первый запуск, новая/очищенная SRAM). Если настройки уже сохранены, действует
+# сохранённое значение - его можно переключить в дополнительном меню.
+INTRO_DEFAULT_ON = _uc.get_bool("menu", "intro_default", False)
 
 FONT_PATCH_ENABLED = _uc.get_bool("font", "patch", True)
 FONT_PATCH_FILE    = _uc.get_str("font",  "file",  "font_patch.ini")
@@ -305,7 +325,13 @@ else:
     MARQ_PPU_LO  = 0x06E2
     MARQ_PPU_HI  = 0x06E3
     MARQ_LEN_TMP = 0x06E4
-    RESTORE_BUF  = 0x06E8
+    # RESTORE_BUF: копия первых NAME_VISIBLE символов старой строки (marquee).
+    # Раньше лежал на $06E8 и имел всего 11 байт ($06E8..$06F2): при
+    # name_visible > 11 запись уходила в CFG5007 ($06F3), CONSOLE_TYPE_RAM,
+    # IRQ_DIV_COUNTER, PROMPT_ARM_PENDING, CUR_BASE_* и т.д. -> ломалась графика
+    # при движении курсора. В mode=2 диапазон $0741..$0781 не используется
+    # (там живёт только mode=1), до MA_MAP_RAM ($0782) - 65 байт.
+    RESTORE_BUF  = 0x0741
 
     RESET_CURSOR_REQ = 0x06E5
     A_BLOCK_REQ      = 0x06E6

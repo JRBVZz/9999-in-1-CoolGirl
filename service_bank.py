@@ -982,7 +982,10 @@ sic_line3:
 """
     return assemble_6502(src, origin_cpu)
 
-def build_service_load_state(origin_cpu, service_enable_cpu, service_disable_cpu):
+def build_service_load_state(origin_cpu, service_enable_cpu, service_disable_cpu,
+                             total_slots=9999):
+    # total_slots: сохранённая позиция должна быть < total_slots (иначе сброс в 0)
+    th, tl = (total_slots >> 8) & 0xFF, total_slots & 0xFF
     src = f"""
 service_load_state:
     jsr ${service_enable_cpu:04X}
@@ -1022,11 +1025,11 @@ service_load_state:
     jmp sls_clear
 sls_chk_mid:
     lda $19
-    cmp #$27
+    cmp #${th:02X}
     bcc sls_ok
     bne sls_clear
     lda $18
-    cmp #$0F
+    cmp #${tl:02X}
     bcs sls_clear
 sls_ok:
     rts
@@ -1540,21 +1543,3 @@ helper_restore:
     rts
 """
     return assemble_6502(src, ram_origin)
-
-
-# ============================================================
-# V5.22.7: УДАЛЁН блок SUBMENU SERVICES (новое).
-# 18 builder-функций (build_submenu_*) — legacy V5.16, перешли на новую
-# архитектуру через build_service_menu_ui_nmi/build_service_submenu_draw в
-# options_prompt.py. Ни одна из этих функций не вызывалась в builder.py.
-# Также ссылались на несуществующие константы (CFG_SIG0_VAL, BUSY_FLAG_ZP,
-# SM_*, ORIG_NAMETAB, ORIG_CURSOR) — даже если бы их вызвать, билд упал бы.
-# ============================================================
-
-
-# V5.22.7: build_svc_load_palette_for_screen удалён.
-# Вызывался из NMI как часть двухфазной смены экрана. После миграции музыки
-# на APU frame counter IRQ механизм перестал быть нужен. Парный код
-# (build_scr_chg_trigger, SCR_CHG_PENDING/DESC, проверка фазы 1 в
-# combined_nmi_hook) тоже удалён — см. fixed_bank.py и options_prompt.py.
-# =============================================================================
